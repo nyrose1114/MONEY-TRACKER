@@ -294,14 +294,18 @@ function clean(o){
   const accOk=id=>accounts.some(a=>a.id===id)?id:'';
   const tx=[];
   for(const t of o.tx){
-    if(!t||['out','in','move'].indexOf(t.type)<0)return null;
-    if(!validDate(t.date)||!validAmt(t.amt))return null;
+    if(!t||['out','in','move','back'].indexOf(t.type)<0)return null;
+    /* 나눠 낸 결제: paid=통장에서 나간 총액, amt=내 몫(0원도 가능) */
+    const split=t.type==='out'&&t.cat!==SAVE&&validAmt(t.paid)&&Number.isInteger(t.amt)&&t.amt>=0&&t.amt<t.paid;
+    if(!validDate(t.date)||!(validAmt(t.amt)||split))return null;
     /* 예전 더치페이 기록은 내 부담 금액만 남김 */
-    const mine=t.type==='out'&&Number.isInteger(t.settled)&&t.settled>0&&t.settled<=t.amt?t.amt-t.settled:t.amt;
-    if(!mine)continue;
+    const mine=split?t.amt:t.type==='out'&&Number.isInteger(t.settled)&&t.settled>0&&t.settled<=t.amt?t.amt-t.settled:t.amt;
+    if(!mine&&!split)continue;
     const r={id:String(t.id||uid()),type:t.type,amt:mine,date:t.date,memo:String(t.memo||'').slice(0,40),account:t.account===VAULT&&t.type==='move'?VAULT:accOk(t.account)};
+    if(split)r.paid=t.paid;
     if(typeof t.rid==='string')r.rid=t.rid;
     if(t.type==='move'){r.cat='이체';r.to=accOk(t.to);tx.push(r);continue;}
+    if(t.type==='back'){r.cat='정산';r.ref=String(t.ref||'');tx.push(r);continue;}
     const cat=t.cat==='여가'&&t.type==='out'?'취미':t.cat;
     r.cat=(t.type==='in'?has(IN_CATS,cat):outOk(cat))?cat:'기타';
     if(t.type==='out'&&t.impulse===true)r.impulse=true;
@@ -346,6 +350,7 @@ function clean(o){
 const catsOf=type=>type==='in'?IN_CATS:S.cats.out;
 function emoji(t,cat){
   if(t==='move')return '🔄';
+  if(t==='back')return '🤝';
   if(cat===SAVE&&t!=='in')return SAVE_E;
   const c=catsOf(t).find(x=>x[0]===cat);return c?c[1]:'✏️';
 }
@@ -372,7 +377,8 @@ function balances(){
   S.tx.forEach(t=>{
     if(t.type==='in')add(t.account,t.amt);
     else if(t.type==='move'){add(t.account,-t.amt);add(t.to,t.amt);}
-    else{add(t.account,-t.amt);if(t.cat===SAVE)b[VAULT]+=t.amt;}
+    else if(t.type==='back')add(t.account,t.amt);
+    else{add(t.account,-(t.paid||t.amt));if(t.cat===SAVE)b[VAULT]+=t.amt;}
   });
   S.trades.forEach(r=>{const v=Math.round(r.qty*r.price);add(r.account,r.side==='buy'?-v:v);});
   return b;
@@ -573,18 +579,28 @@ function monthBar(title){
   return `<div class="top"><button class="icon" data-a="prev" aria-label="이전 달">‹</button><h1>${view.ym.slice(0,4)}년 ${mLabel(view.ym)}${title?' '+title:''}</h1><button class="icon" data-a="next" aria-label="다음 달">›</button></div>`;
 }
 function meter(p,over,label){return `<span class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(p)}" aria-label="${label}"><i class="${over?'over':''}" style="width:${Math.max(0,Math.min(100,p))}%"></i></span>`;}
+/* 받을 돈: 나눠 낸 결제에서 아직 돌려받지 못한 금액 */
+const gotFor=id=>S.tx.reduce((a,x)=>x.type==='back'&&x.ref===id?a+x.amt:a,0);
+const owed=t=>t.paid?t.paid-t.amt-gotFor(t.id):0;
 function txRow(t,withDate){
   const sub=[];
   if(withDate)sub.push(dLabel(t.date));
   if(t.type==='move')sub.push((accName(t.account)||'미지정')+' → '+(accName(t.to)||'미지정'));
-  else{
+  else if(t.type==='back'){
+    const o=S.tx.find(x=>x.id===t.ref);
+    sub.push('받은 돈'+(o?' · '+(o.memo||o.cat):''));
+    if(t.account)sub.push(accName(t.account));
+  }else{
     if(t.memo)sub.push(t.cat);
     if(t.account)sub.push(accName(t.account));
+    if(t.paid){const left=owed(t);sub.push('결제 '+won(t.paid)+' · '+(left>0?'받을 돈 '+won(left):'다 받음'));}
     if(isRecurTx(t))sub.push('🔁 정기');
     if(t.impulse)sub.push('⚡ 충동');
   }
-  const sign=t.type==='in'?'+':t.type==='move'||isSave(t)?'':'-';
-  return `<button class="row" data-a="edit" data-v="${esc(t.id)}"><span class="e">${emoji(t.type,t.cat)}</span><span class="t"><b>${esc(t.memo||t.cat)}</b>${sub.length?`<small>${esc(sub.join(' · '))}</small>`:''}</span><span class="a num${t.type==='in'?' plus':''}">${sign}${won(t.amt)}원</span></button>`;
+  const plus=t.type==='in'||t.type==='back';
+  const sign=plus?'+':t.type==='move'||isSave(t)||!t.amt?'':'-';
+  const title=t.type==='back'?(t.memo||'받은 돈'):(t.memo||t.cat);
+  return `<button class="row" data-a="edit" data-v="${esc(t.id)}"><span class="e">${emoji(t.type,t.cat)}</span><span class="t"><b>${esc(title)}</b>${sub.length?`<small>${esc(sub.join(' · '))}</small>`:''}</span><span class="a num${plus?' plus':''}">${sign}${won(t.amt)}원</span></button>`;
 }
 /* 자동 기록 표시가 생기기 전의 기록은 정기 항목의 내용과 비교해서 찾음 */
 function isRecurTx(t){
@@ -604,7 +620,7 @@ function dayView(){
   const d=view.date,list=S.tx.filter(t=>t.date===d),trades=S.trades.filter(r=>r.date===d);
   const out=sum(list,'out'),inc=sum(list,'in'),saved=sum(list,'save'),t=today();
   const wi=weekInfo(mondayOf(d)),ym=d.slice(0,7),b=budgetOf(ym),mOut=sum(monthTx(ym),'out');
-  const order={in:0,out:1,move:2};
+  const order={in:0,out:1,back:2,move:3};
   const rows=list.slice().sort((a,c)=>order[a.type]-order[c.type]).map(x=>txRow(x,false)).join('')+trades.map(tradeRow).join('');
   const isPast=d<t,stamp=!out&&isPast&&noSpendDays(ym)[d];
   let body;
@@ -763,13 +779,16 @@ function retroView(){
   <div class="tools cap-hide"><button data-a="capture">📸 캡처 화면</button><button data-a="budget">예산 수정</button></div>`;
 }
 function assetsView(){
-  const b=balances(),H=holdings(),accSum=S.accounts.reduce((a,x)=>a+b[x.id],0),stockSum=H.reduce((a,h)=>a+h.value,0),total=accSum+b[VAULT]+stockSum;
+  const b=balances(),H=holdings(),accSum=S.accounts.reduce((a,x)=>a+b[x.id],0),stockSum=H.reduce((a,h)=>a+h.value,0);
+  const recv=S.tx.filter(t=>t.paid&&owed(t)>0).sort((x,y)=>x.date<y.date?1:-1),recvSum=recv.reduce((a,t)=>a+owed(t),0),total=accSum+b[VAULT]+stockSum+recvSum;
   const vault=S.tx.filter(t=>isSave(t)||(t.type==='move'&&t.account===VAULT)).sort((x,y)=>x.date<y.date?1:x.date>y.date?-1:0).slice(0,5);
   const held=H.filter(h=>h.q>0||S.trades.some(r=>r.stock===h.s.id));
   return `<div class="top"><span class="icon"></span><h1>자산</h1><button class="icon" data-a="menu" aria-label="더보기">⋯</button></div>
-  <div class="card asset-total"><small>총 자산</small><b class="num${total<0?' bad':''}">${won(total)}원</b><p class="num">통장 ${won(accSum)} · 금고 ${won(b[VAULT])} · 주식 ${won(stockSum)}</p></div>
+  <div class="card asset-total"><small>총 자산</small><b class="num${total<0?' bad':''}">${won(total)}원</b><p class="num">통장 ${won(accSum)} · 금고 ${won(b[VAULT])} · 주식 ${won(stockSum)}${recvSum?' · 받을 돈 '+won(recvSum):''}</p></div>
   <div class="sec"><h2>통장</h2><span><button data-a="move">이체</button> <button data-a="newAcc">+ 추가</button></span></div>
   <div class="card">${S.accounts.length?S.accounts.map(a=>`<button class="row" data-a="editAcc" data-v="${esc(a.id)}"><span class="e">🏦</span><span class="t"><b>${esc(a.name)}</b></span><span class="a num${b[a.id]<0?' bad':''}">${won(b[a.id])}원</span></button>`).join(''):'<div class="empty"><b>등록된 통장이 없어요</b></div>'}</div>
+  <div class="sec"><h2>받을 돈 <span class="num muted" style="font-weight:500">${won(recvSum)}원</span></h2></div>
+  <div class="card">${recv.length?recv.map(t=>`<button class="row" data-a="recv" data-v="${esc(t.id)}"><span class="e">${emoji('out',t.cat)}</span><span class="t"><b>${esc(t.memo||t.cat)}</b><small class="num">${dLabel(t.date)} · 결제 ${won(t.paid)} · 내 몫 ${won(t.amt)}${gotFor(t.id)?' · 받음 '+won(gotFor(t.id)):''}</small></span><span class="a num">${won(owed(t))}원</span></button>`).join(''):'<div class="empty"><b>받을 돈이 없어요</b>먼저 내고 돌려받을 결제는 기록할 때 <b style="display:inline;font-size:inherit">나눠 냄 · 대신 결제</b>를 켜면 여기 모여요</div>'}</div>
   <div class="sec"><h2>금고 <span class="num muted" style="font-weight:500">${won(b[VAULT])}원</span></h2><span><button data-a="saveNow">저축하기</button> <button data-a="moveOut">꺼내기</button></span></div>
   <div class="card">${vault.length?vault.map(t=>txRow(t,true)).join(''):'<div class="empty"><b>금고가 비어 있어요</b>저축으로 기록한 돈만 여기에 쌓여요</div>'}</div>
   <div class="sec"><h2>주식 <span class="num muted" style="font-weight:500">${won(stockSum)}원</span></h2><button data-a="trade">+ 매수·매도</button></div>
@@ -867,17 +886,32 @@ function accChips(field,sel,none){
 }
 const delBtn=(act,txt)=>`<button class="del${sheet.sure?' sure':''}" data-a="${act}">${sheet.sure?'정말 '+txt:txt}</button>`;
 const SH={
+  recv(){
+    const t=S.tx.find(x=>x.id===sheet.ref),list=S.tx.filter(x=>x.type==='back'&&x.ref===sheet.ref).sort((a,b)=>a.date<b.date?1:-1),left=t?Math.max(0,owed(t)):0;
+    const info=t?`<div class="card calc"><div><span>${esc(t.memo||t.cat)} · ${dLabel(t.date)}</span></div><div><span>결제한 총액</span><b class="num">${won(t.paid||t.amt)}원</b></div><div><span>내 몫</span><b class="num">${won(t.amt)}원</b></div><div><span>받은 돈</span><b class="num">${won(gotFor(t.id))}원</b></div><div class="total"><span>남은 받을 돈</span><b class="num">${won(left)}원</b></div></div>`:'<p class="note" style="margin-top:0">원래 결제 기록이 지워졌어요.</p>';
+    return shell(sheet.editId?'받은 돈 수정':'받은 돈 기록',
+      `${info}<label class="lbl">받은 금액</label>${moneyIn('digits',sheet.digits,'0','amt')}
+      <label class="lbl">들어온 통장</label>${accChips('account',sheet.account,'미지정')}
+      <div class="two"><div><label class="lbl">날짜</label>${dateIn('date',sheet.date)}</div><div><label class="lbl">보낸 사람</label>${textIn('memo',sheet.memo,'예: 엄마',40)}</div></div>
+      ${t&&left>0&&!sheet.editId?`<button class="ghost${sheet.sureA?' sure':''}" data-a="absorb">${sheet.sureA?'정말 내 지출로 옮기기':'남은 '+won(left)+'원은 못 받음 (내가 부담)'}</button>`:''}
+      ${list.length?`<div class="sec"><h2>받은 기록</h2></div><div class="card">${list.map(x=>`<div class="alloc"><span class="t num">${won(x.amt)}원<small>${dLabel(x.date)}${x.memo?' · '+esc(x.memo):''}${x.account?' · '+esc(accName(x.account)):''}</small></span><button class="x${sheet.sureB===x.id?' sure':''}" data-a="delBack" data-v="${esc(x.id)}">${sheet.sureB===x.id?'정말 삭제':'삭제'}</button></div>`).join('')}</div>`:''}
+      <p class="note">돌려받은 돈은 수입이 아니라서 예산에 영향을 주지 않고, 통장 잔액만 늘어요.</p>`,
+      `<button class="primary" id="save" data-a="saveBack">${sheet.editId?'수정':'받은 돈 기록'}</button>`);
+  },
   entry(){
     const out=sheet.type==='out',sv=sheet.type==='save';
     const seg=[['out','지출'],['in','수입'],['save','저축']].map(x=>`<button data-a="type" data-v="${x[0]}" aria-pressed="${sheet.type===x[0]}">${x[1]}</button>`).join('');
     const accLabel=sheet.type==='in'?'들어온 통장':sv?'빠져나간 통장':'나간 통장';
     return shell(sheet.id?'기록 수정':'새 기록',
       `<div class="seg">${seg}</div>
-      <label class="lbl">금액</label>${moneyIn('digits',sheet.digits,'0','amt')}
+      <label class="lbl">${out&&sheet.split?'결제한 총액':'금액'}</label>${moneyIn('digits',sheet.digits,'0','amt')}
+      ${out?`<div class="chips" style="margin-top:8px"><button class="toggle" data-a="splitTg" aria-pressed="${!!sheet.split}">👥 나눠 냄 · 대신 결제</button><button class="toggle" data-a="impulse" aria-pressed="${!!sheet.impulse}">⚡ 충동지출</button></div>`:''}
+      ${out&&sheet.split?`<label class="lbl">내 몫 (예산에는 이 금액만 들어가요)</label><input class="input num" data-m="mine" inputmode="numeric" autocomplete="off" placeholder="0" value="${sheet.mine?won(sheet.mine):''}">
+      <div class="chips" style="margin-top:6px">${[['0','전부 대신 결제']].concat([2,3,4,5,6,7,8,9,10].map(n=>[String(n),'÷'+n])).map(x=>`<button data-a="mineQuick" data-v="${x[0]}">${x[1]}</button>`).join('')}</div><div class="hintline" id="mineHint"></div>`:''}
       ${sv?'<p class="note">저축한 돈은 금고에 쌓이고 지출로 계산되지 않아요.</p>':`<label class="lbl">항목</label>${chips(catsOf(sheet.type),'cat',sheet.cat)}`}
       <label class="lbl">${accLabel}</label>${accChips('account',sheet.account,'미지정')}
       <div class="two"><div><label class="lbl">날짜</label>${dateIn('date',sheet.date)}</div><div><label class="lbl">제목</label>${textIn('memo',sheet.memo,'예: 학식 돈까스',40)}</div></div>
-      ${out?`<button class="toggle" style="margin-top:12px" data-a="impulse" aria-pressed="${!!sheet.impulse}">⚡ 충동지출</button>`:''}`,
+      ${out&&sheet.id&&sheet.split&&S.tx.some(x=>x.id===sheet.id&&x.paid)?`<button class="ghost" data-a="recv" data-v="${esc(sheet.id)}">🤝 받은 돈 기록하기</button>`:''}`,
       (sheet.id?delBtn('remove','삭제'):'')+'<button class="primary" id="save" data-a="save">저장</button>');
   },
   move(){
@@ -999,8 +1033,12 @@ function allocSummary(){
 function refresh(){
   if(!sheet)return;
   const s=$('save'),amt=Number(sheet.digits||0);
+  if(sheet.kind==='recv'&&s)s.disabled=!amt||!sheet.date;
   if(sheet.kind==='entry'){
-    if(s)s.disabled=!amt||!sheet.date;
+    const split=sheet.type==='out'&&sheet.split,mine=Number(sheet.mine||0),bad=split&&mine>=amt;
+    if(s)s.disabled=!amt||!sheet.date||bad;
+    const h=$('mineHint');
+    if(h){h.textContent=!amt?'':bad?'내 몫은 결제한 총액보다 작아야 해요':'받을 돈 '+won(amt-mine)+'원';h.className='hintline'+(bad?' bad':'');}
   }
   if(sheet.kind==='recForm'||sheet.kind==='wish')if(s)s.disabled=!amt;
   if(sheet.kind==='wish'){
@@ -1085,16 +1123,44 @@ const A={
   edit(v){
     const t=S.tx.find(x=>x.id===v);if(!t)return;
     if(t.type==='move'){open({kind:'move',id:t.id,from:t.account,to:t.to,digits:String(t.amt),orig:t.amt,date:t.date,memo:t.memo});return;}
-    open({kind:'entry',id:t.id,type:isSave(t)?'save':t.type,cat:t.cat,date:t.date,memo:t.memo,digits:String(t.amt),impulse:!!t.impulse,account:t.account,rid:t.rid});
+    if(t.type==='back'){open({kind:'recv',ref:t.ref,editId:t.id,digits:String(t.amt),account:t.account,date:t.date,memo:t.memo});return;}
+    open({kind:'entry',id:t.id,type:isSave(t)?'save':t.type,cat:t.cat,date:t.date,memo:t.memo,digits:String(t.paid||t.amt),split:!!t.paid,mine:t.paid&&t.amt?String(t.amt):'',impulse:!!t.impulse,account:t.account,rid:t.rid});
+  },
+  splitTg(){sheet.split=!sheet.split;renderSheet();},
+  mineQuick(v){const tot=Number(sheet.digits||0),n=Number(v);sheet.mine=n&&tot?String(Math.round(tot/n)):'';renderSheet();},
+  recv(v){
+    const t=S.tx.find(x=>x.id===v);if(!t)return;const left=Math.max(0,owed(t));
+    open({kind:'recv',ref:v,digits:left?String(left):'',account:t.account||S.lastAcc,date:today(),memo:''},'amt');
+  },
+  saveBack(){
+    const amt=Number(sheet.digits||0);if(!amt||!sheet.date)return;
+    const r={id:sheet.editId||uid(),type:'back',cat:'정산',amt,ref:sheet.ref,account:sheet.account||'',date:sheet.date,memo:sheet.memo.trim().slice(0,40)};
+    if(sheet.editId)S.tx=S.tx.map(x=>x.id===sheet.editId?r:x);else S.tx.push(r);
+    persist();close();render();
+    const t=S.tx.find(x=>x.id===r.ref),left=t?owed(t):0;
+    toast(!t?'저장했어요':left>0?'받을 돈이 '+won(left)+'원 남았어요':'다 받았어요');
+  },
+  absorb(){
+    if(!sheet.sureA){sheet.sureA=true;renderSheet();return;}
+    const t=S.tx.find(x=>x.id===sheet.ref);if(!t)return;
+    t.amt=t.paid-gotFor(t.id);if(t.amt>=t.paid)delete t.paid;
+    persist();close();render();toast('남은 금액을 내 지출로 옮겼어요');
+  },
+  delBack(v){
+    if(sheet.sureB!==v){sheet.sureB=v;renderSheet();return;}
+    S.tx=S.tx.filter(x=>x.id!==v);persist();render();
+    if(sheet.editId===v)close();else{sheet.sureB=null;renderSheet();}
   },
   setf(v,b){sheet[b.getAttribute('data-k')]=v;sheet.sure=false;renderSheet();},
-  type(v){if(sheet.type===v)return;sheet.type=v;sheet.cat=v==='save'?SAVE:catsOf(v)[0][0];sheet.impulse=false;renderSheet();},
+  type(v){if(sheet.type===v)return;sheet.type=v;sheet.cat=v==='save'?SAVE:catsOf(v)[0][0];sheet.impulse=false;sheet.split=false;renderSheet();},
   impulse(){sheet.impulse=!sheet.impulse;renderSheet();},
   close,
   save(){
     const amt=Number(sheet.digits||0);if(!amt||!sheet.date)return;
-    const sv=sheet.type==='save',type=sv?'out':sheet.type;
-    const r={id:sheet.id||uid(),type,amt,cat:sv?SAVE:sheet.cat,date:sheet.date,memo:sheet.memo.trim().slice(0,40),account:sheet.account||''};
+    const sv=sheet.type==='save',type=sv?'out':sheet.type,split=type==='out'&&!sv&&sheet.split,mine=split?Number(sheet.mine||0):amt;
+    if(split&&mine>=amt)return;
+    const r={id:sheet.id||uid(),type,amt:mine,cat:sv?SAVE:sheet.cat,date:sheet.date,memo:sheet.memo.trim().slice(0,40),account:sheet.account||''};
+    if(split)r.paid=amt;
     if(sheet.rid)r.rid=sheet.rid;
     if(type==='out'&&!sv&&sheet.impulse)r.impulse=true;
     if(sheet.id)S.tx=S.tx.map(t=>t.id===sheet.id?r:t);else S.tx.push(r);
@@ -1104,7 +1170,8 @@ const A={
     const ym=r.date.slice(0,7);view.ym=ym;if(view.tab==='day')view.date=r.date;
     close();render();
     const goal=catMap(ym)[SAVE];
-    if(sv)toast(goal?'저축 목표의 '+Math.round(sum(monthTx(ym),'save')/goal*100)+'%를 채웠어요':'금고에 저축했어요');
+    if(r.paid)toast('받을 돈 '+won(Math.max(0,owed(r)))+'원을 기록했어요');
+    else if(sv)toast(goal?'저축 목표의 '+Math.round(sum(monthTx(ym),'save')/goal*100)+'%를 채웠어요':'금고에 저축했어요');
     else toast(type==='out'?budgetToast(ym,r.cat,'저장했어요'):'저장했어요');
   },
   remove(){
